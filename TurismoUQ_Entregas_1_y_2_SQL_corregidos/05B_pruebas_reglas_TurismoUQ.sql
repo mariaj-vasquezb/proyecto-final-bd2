@@ -1,0 +1,152 @@
+-- DBEAVER + ORACLE XE 21c.
+-- Para SQL: ejecutar una sentencia. Para PL/SQL: seleccionar el bloque completo
+-- DECLARE/BEGIN o CREATE...END; sin la linea / y usar Ejecutar sentencia SQL.
+-- Conservar la misma conexion para SAVEPOINT/ROLLBACK. Activar salida DBMS Output.
+-- REGRESIONES DE INTEGRIDAD. Ejecutar despues de 05, con DBMS Output activo.
+-- Cada caso exige su error exacto; una aceptacion indebida detiene la prueba.
+-- No realiza COMMIT. Conserva cualquier trabajo previo de la sesion.
+DECLARE
+  v_res NUMBER; v_det NUMBER; v_hab NUMBER; v_alo NUMBER; v_otra NUMBER;
+  v_semilla NUMBER; v_in DATE; v_out DATE; v_completada NUMBER; v_fin DATE;
+  v_n NUMBER; v_antes NUMBER; v_pago NUMBER; v_total NUMBER; v_reembolso NUMBER;
+  v_nueva NUMBER; v_fecha DATE; v_ok BOOLEAN;
+  PROCEDURE esperar(p_sql VARCHAR2,p_codigo NUMBER,p_nombre VARCHAR2) IS
+    v_rechazo BOOLEAN:=FALSE;
+  BEGIN
+    BEGIN EXECUTE IMMEDIATE p_sql;
+    EXCEPTION WHEN OTHERS THEN
+      IF SQLCODE<>p_codigo THEN RAISE; END IF;
+      v_rechazo:=TRUE;
+    END;
+    IF NOT v_rechazo THEN RAISE_APPLICATION_ERROR(-20990,'No se rechazo: '||p_nombre); END IF;
+    DBMS_OUTPUT.PUT_LINE('CORRECTO: '||p_nombre||' ('||p_codigo||')');
+  END;
+BEGIN
+  SAVEPOINT regresiones_reglas;
+  SELECT rh.ID_RESERVA,rh.ID_HABITACION,h.ID_ALOJAMIENTO,rh.FECHA_CHECKIN,rh.FECHA_CHECKOUT
+    INTO v_semilla,v_hab,v_alo,v_in,v_out
+  FROM RESERVA_HABITACION rh JOIN RESERVA r ON r.ID_RESERVA=rh.ID_RESERVA
+    JOIN HABITACION h ON h.ID_HABITACION=rh.ID_HABITACION
+  WHERE r.ESTADO='CONFIRMADA' AND
+    (SELECT COUNT(*) FROM RESERVA_HABITACION x WHERE x.ID_RESERVA=r.ID_RESERVA)=1
+  ORDER BY rh.ID_RESERVA_HAB FETCH FIRST 1 ROW ONLY;
+  SELECT MIN(ID_HABITACION) INTO v_otra FROM HABITACION WHERE ID_ALOJAMIENTO<>v_alo;
+  INSERT INTO RESERVA(ID_CLIENTE,FECHA_CHECKIN,FECHA_CHECKOUT,ESTADO)
+  VALUES(1,v_in,v_out,'PENDIENTE') RETURNING ID_RESERVA INTO v_res;
+  INSERT INTO RESERVA_HABITACION(ID_RESERVA,ID_HABITACION,FECHA_CHECKIN,FECHA_CHECKOUT,NUM_HUESPEDES)
+  VALUES(v_res,v_hab,v_in,v_out,1) RETURNING ID_RESERVA_HAB INTO v_det;
+
+  esperar('UPDATE RESERVA SET ESTADO=''CONFIRMADA'' WHERE ID_RESERVA='||v_res,-20026,'confirmar pendiente solapada');
+  esperar('UPDATE RESERVA_HABITACION SET NUM_HUESPEDES=999 WHERE ID_RESERVA_HAB='||v_det,-20031,'capacidad por DML directo');
+  esperar('UPDATE RESERVA_HABITACION SET FECHA_CHECKIN=FECHA_CHECKIN-1 WHERE ID_RESERVA_HAB='||v_det,-20032,'detalle fuera de cabecera');
+  esperar('UPDATE RESERVA SET FECHA_CHECKIN=FECHA_CHECKIN+1 WHERE ID_RESERVA='||v_res,-20032,'cabecera que excluye detalle');
+  esperar('INSERT INTO RESERVA_HABITACION(ID_RESERVA,ID_HABITACION,FECHA_CHECKIN,FECHA_CHECKOUT,NUM_HUESPEDES) '
+    ||'SELECT '||v_res||','||v_otra||',FECHA_CHECKIN,FECHA_CHECKOUT,1 FROM RESERVA WHERE ID_RESERVA='||v_res,
+    -20033,'habitaciones de diferentes alojamientos');
+  esperar('INSERT INTO RESERVA_SERVICIO(ID_RESERVA,ID_SERVICIO,CANTIDAD,PRECIO_UNITARIO) SELECT '
+    ||v_res||',MIN(ID_SERVICIO),1,100 FROM SERVICIO WHERE ID_ALOJAMIENTO<>'||v_alo,-20034,'servicio ajeno');
+  esperar('INSERT INTO RESENA(ID_RESERVA,ID_ALOJAMIENTO,CALIFICACION) VALUES('
+    ||v_res||','||v_alo||',4)',-20035,'resena de pendiente');
+  esperar('DELETE FROM RESERVA_HABITACION WHERE ID_RESERVA='||v_semilla,-20030,'borrar ultima habitacion activa');
+  esperar('INSERT INTO RESERVA(ID_CLIENTE,FECHA_CHECKIN,FECHA_CHECKOUT,ESTADO) VALUES(1,DATE ''2026-12-01'',DATE ''2026-12-03'',''CONFIRMADA'')',
+    -20030,'cabecera confirmada sin habitaciones');
+  esperar('INSERT INTO TEMPORADA(NOMBRE,TIPO,FECHA_INICIO,FECHA_FIN) VALUES(''Prueba duplicada'',''ALTA'',DATE ''2026-01-01'',DATE ''2026-01-01'')',
+    -20036,'temporadas superpuestas');
+  esperar('UPDATE USUARIO_SISTEMA SET ID_ALOJAMIENTO=NULL WHERE ID_USUARIO=1',-2290,'encargado sin alojamiento');
+
+  SELECT r.ID_RESERVA,h.ID_ALOJAMIENTO,MAX(rh.FECHA_CHECKOUT)
+    INTO v_completada,v_alo,v_fin
+  FROM RESERVA r JOIN RESERVA_HABITACION rh ON rh.ID_RESERVA=r.ID_RESERVA
+    JOIN HABITACION h ON h.ID_HABITACION=rh.ID_HABITACION
+  WHERE r.ESTADO='COMPLETADA' AND NOT EXISTS (SELECT 1 FROM RESENA re WHERE re.ID_RESERVA=r.ID_RESERVA)
+  GROUP BY r.ID_RESERVA,h.ID_ALOJAMIENTO ORDER BY r.ID_RESERVA FETCH FIRST 1 ROW ONLY;
+  SELECT MIN(ID_ALOJAMIENTO) INTO v_otra FROM ALOJAMIENTO WHERE ID_ALOJAMIENTO<>v_alo;
+  esperar('INSERT INTO RESENA(ID_RESERVA,ID_ALOJAMIENTO,CALIFICACION) VALUES('
+    ||v_completada||','||v_otra||',4)',-20035,'resena de alojamiento no visitado');
+  esperar('INSERT INTO RESENA(ID_RESERVA,ID_ALOJAMIENTO,CALIFICACION,FECHA_RESENA) SELECT '
+    ||v_completada||','||v_alo||',4,FECHA_CHECKIN-1 FROM RESERVA WHERE ID_RESERVA='||v_completada,
+    -20035,'resena anterior al checkout');
+  INSERT INTO RESENA(ID_RESERVA,ID_ALOJAMIENTO,CALIFICACION,FECHA_RESENA)
+  VALUES(v_completada,v_alo,4,v_fin);
+  DBMS_OUTPUT.PUT_LINE('CORRECTO: resena de alojamiento visitado despues del checkout');
+
+  -- Una tarifa usada por la reserva semilla no puede desaparecer.
+  SELECT MIN(t.ID_TARIFA) INTO v_pago FROM TARIFA t JOIN TEMPORADA s ON s.ID_TEMPORADA=t.ID_TEMPORADA
+  WHERE t.ID_HABITACION=v_hab AND v_in BETWEEN s.FECHA_INICIO AND s.FECHA_FIN;
+  esperar('DELETE FROM TARIFA WHERE ID_TARIFA='||v_pago,-20003,'eliminar tarifa requerida por estadia activa');
+
+  -- Reembolso de abonos: mas de cinco dias = 80%; cinco exactos y menos = 0%.
+  -- Usamos fechas explicitas de simulacion; la prueba revierte todos los casos.
+  v_fecha:=DATE '2026-12-20';
+  FOR caso IN 1..3 LOOP
+    SELECT h.ID_HABITACION INTO v_hab FROM HABITACION h WHERE h.ACTIVA='S' AND NOT EXISTS (
+      SELECT 1 FROM RESERVA_HABITACION d JOIN RESERVA r ON r.ID_RESERVA=d.ID_RESERVA
+      WHERE d.ID_HABITACION=h.ID_HABITACION AND r.ESTADO IN ('CONFIRMADA','COMPLETADA')
+        AND d.FECHA_CHECKIN<v_fecha+2 AND d.FECHA_CHECKOUT>v_fecha)
+    ORDER BY h.ID_HABITACION FETCH FIRST 1 ROW ONLY;
+    PKG_TURISMOUQ.SP_CREAR_RESERVA(1,v_hab,v_fecha,v_fecha+2,1,v_nueva);
+    v_total:=PKG_TURISMOUQ.FN_TOTAL_RESERVA(v_nueva);
+    INSERT INTO PAGO(ID_RESERVA,FECHA_PAGO,MONTO,METODO,ESTADO)
+    VALUES(v_nueva,SYSDATE,ROUND(v_total*.4,2),'PSE','EXITOSO');
+    IF PKG_TURISMOUQ.FN_RESERVA_PAGADA(v_nueva)<>'N' THEN
+      RAISE_APPLICATION_ERROR(-20990,'Anticipo considerado pago completo');
+    END IF;
+    INSERT INTO PAGO(ID_RESERVA,FECHA_PAGO,MONTO,METODO,ESTADO)
+    VALUES(v_nueva,SYSDATE,v_total-ROUND(v_total*.4,2),'PSE','EXITOSO');
+    IF PKG_TURISMOUQ.FN_RESERVA_PAGADA(v_nueva)<>'S' THEN
+      RAISE_APPLICATION_ERROR(-20990,'Abonos completos no reconocidos');
+    END IF;
+    PKG_TURISMOUQ.SP_CANCELAR_RESERVA(v_nueva,v_fecha-CASE caso WHEN 1 THEN 6 WHEN 2 THEN 5 ELSE 3 END);
+    SELECT SUM(MONTO_REEMBOLSADO) INTO v_reembolso FROM PAGO WHERE ID_RESERVA=v_nueva;
+    IF caso=1 THEN
+      SELECT SUM(ROUND(MONTO*.8,2)) INTO v_pago FROM PAGO WHERE ID_RESERVA=v_nueva;
+    ELSE v_pago:=0; END IF;
+    IF v_reembolso<>v_pago OR PKG_TURISMOUQ.FN_RESERVA_PAGADA(v_nueva)<>'N' THEN
+      RAISE_APPLICATION_ERROR(-20990,'Reembolso o estado de pago incorrecto');
+    END IF;
+    esperar('UPDATE RESERVA SET ESTADO=''CONFIRMADA'',FECHA_CANCELACION=NULL WHERE ID_RESERVA='||v_nueva,
+      -20037,'reactivar cancelada final');
+    DBMS_OUTPUT.PUT_LINE('CORRECTO: cancelacion caso '||caso||'; reembolso='||v_reembolso);
+  END LOOP;
+
+  -- Los intervalos son semiabiertos: el checkout permite el siguiente check-in.
+  SELECT h.ID_HABITACION INTO v_hab FROM HABITACION h WHERE h.ACTIVA='S' AND NOT EXISTS (
+    SELECT 1 FROM RESERVA_HABITACION d JOIN RESERVA r ON r.ID_RESERVA=d.ID_RESERVA
+    WHERE d.ID_HABITACION=h.ID_HABITACION AND r.ESTADO IN ('CONFIRMADA','COMPLETADA')
+      AND d.FECHA_CHECKIN<v_fecha+4 AND d.FECHA_CHECKOUT>v_fecha)
+  ORDER BY h.ID_HABITACION FETCH FIRST 1 ROW ONLY;
+  PKG_TURISMOUQ.SP_CREAR_RESERVA(1,v_hab,v_fecha,v_fecha+2,1,v_nueva);
+  PKG_TURISMOUQ.SP_CREAR_RESERVA(1,v_hab,v_fecha+2,v_fecha+4,1,v_nueva);
+  DBMS_OUTPUT.PUT_LINE('CORRECTO: check-in el mismo dia del checkout ajeno');
+  esperar('DECLARE v NUMBER; BEGIN v:=PKG_TURISMOUQ.FN_VALOR_ESTADIA(1,DATE ''2026-12-20'',DATE ''2026-12-20''); END;',
+    -20001,'estadia sin noches');
+  esperar('BEGIN PKG_TURISMOUQ.SP_LIQUIDACION_MENSUAL(NULL,1); END;',-20020,'anio nulo del cursor');
+  esperar('BEGIN PKG_TURISMOUQ.SP_LIQUIDACION_MENSUAL(2026.5,1); END;',-20020,'anio no entero del cursor');
+
+  -- Actualizacion masiva de tarifas: exactamente dos filas auditadas.
+  SELECT COUNT(*) INTO v_antes FROM AUDITORIA_TARIFA;
+  UPDATE TARIFA SET PRECIO_NOCHE=PRECIO_NOCHE+1000 WHERE ID_TARIFA IN (1,2);
+  SELECT COUNT(*) INTO v_n FROM AUDITORIA_TARIFA;
+  IF v_n<>v_antes+2 THEN RAISE_APPLICATION_ERROR(-20990,'Auditoria masiva incorrecta'); END IF;
+  UPDATE TARIFA SET PRECIO_NOCHE=PRECIO_NOCHE WHERE ID_TARIFA IN (1,2);
+  SELECT COUNT(*) INTO v_n FROM AUDITORIA_TARIFA;
+  IF v_n<>v_antes+2 THEN RAISE_APPLICATION_ERROR(-20990,'Se audito un precio sin cambio'); END IF;
+  DBMS_OUTPUT.PUT_LINE('CORRECTO: auditoria masiva y actualizacion sin cambio');
+
+  SELECT COUNT(*) INTO v_n FROM (
+    SELECT ID_RESERVA_HAB,ID_RESERVA,ID_HABITACION,FECHA_CHECKIN,FECHA_CHECKOUT FROM RESERVA_HABITACION
+    MINUS
+    SELECT ID_RESERVA_HAB,ID_RESERVA,ID_HABITACION,FECHA_CHECKIN,FECHA_CHECKOUT FROM CONTROL_OCUPACION_RH);
+  IF v_n<>0 THEN RAISE_APPLICATION_ERROR(-20990,'Espejo desincronizado'); END IF;
+  SELECT COUNT(*) INTO v_n FROM (
+    SELECT ID_RESERVA_HAB,ID_RESERVA,ID_HABITACION,FECHA_CHECKIN,FECHA_CHECKOUT FROM CONTROL_OCUPACION_RH
+    MINUS
+    SELECT ID_RESERVA_HAB,ID_RESERVA,ID_HABITACION,FECHA_CHECKIN,FECHA_CHECKOUT FROM RESERVA_HABITACION);
+  IF v_n<>0 THEN RAISE_APPLICATION_ERROR(-20990,'Espejo con filas sobrantes'); END IF;
+  ROLLBACK TO regresiones_reglas;
+  DBMS_OUTPUT.PUT_LINE('TODAS LAS REGRESIONES CORRECTAS; CAMBIOS REVERTIDOS');
+EXCEPTION WHEN OTHERS THEN
+  ROLLBACK TO regresiones_reglas;
+  RAISE;
+END;
+/
